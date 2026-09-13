@@ -1,5 +1,4 @@
 # Deploy MySplitZ
-
 MySplitZ is a static web app that can use Firebase Firestore for shared data.
 
 1. Create a Firebase project and register a Firebase Web App.
