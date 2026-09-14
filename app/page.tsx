@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect */
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   CircleDollarSign,
@@ -188,6 +188,40 @@ const nav = [
   ["ledger", "Ledger", BookOpen],
   ["daybook", "Daybook", ReceiptText],
 ] as const;
+type Page = (typeof nav)[number][0];
+type RecordFilters = {
+  personId: string;
+  tripId: string;
+  from: string;
+  to: string;
+  type: string;
+};
+
+const recordPages = new Set<Page>(["ledger", "daybook"]);
+const ledgerTypes = new Set([
+  "all",
+  "Expense paid",
+  "Expense share",
+  "Settlement paid",
+  "Settlement received",
+]);
+const pageFromView = (view: string | null): Page =>
+  view === "trips" || view === "people" || view === "ledger" || view === "daybook"
+    ? view
+    : "dashboard";
+const viewFromPage = (page: Page) => (page === "dashboard" ? "home" : page);
+
+function routeUrl(page: Page, filters: RecordFilters) {
+  const query = new URLSearchParams({ view: viewFromPage(page) });
+  if (recordPages.has(page)) {
+    if (filters.tripId !== "all") query.set("tripId", filters.tripId);
+    if (filters.personId) query.set("personId", filters.personId);
+    if (filters.from) query.set("from", filters.from);
+    if (filters.to) query.set("to", filters.to);
+    if (page === "ledger" && filters.type !== "all") query.set("type", filters.type);
+  }
+  return `${window.location.pathname}?${query.toString()}`;
+}
 function useData() {
   const [data, setData] = useState<Data>(seed),
     [loading, setLoading] = useState(true),
@@ -454,7 +488,7 @@ function rows(data: Data, personId: string) {
         tripId: e.tripId,
         trip: tr,
         from: payer,
-        to: "Shared trip costs",
+        to: e.participantIds.map((id) => name(data, id)).join(", "),
         debit: 0,
         credit: e.amount,
         balance: 0,
@@ -527,47 +561,119 @@ const Status = ({ value }: any) => (
     {Math.abs(value) < 0.005
       ? "Settled up"
       : value >= 0
-        ? `Should receive ${money(value)}`
-        : `Owes ${money(value)}`}
+        ? `You should receive ${money(value)}`
+        : `You need to pay ${money(value)}`}
   </span>
 );
 const Empty = ({ children }: any) => <div className="empty">{children}</div>;
 export default function Home() {
   const { data, loading, cloud, connectionError, save, remove } = useData(),
-    [page, setPage] = useState("dashboard"),
+    [page, setPage] = useState<Page>("dashboard"),
     [menu, setMenu] = useState(false),
     [modal, setModal] = useState<any>(null),
     [editing, setEditing] = useState<any>(null),
     [person, setPerson] = useState("p1"),
     [tripFilter, setTripFilter] = useState("all"),
+    [from, setFrom] = useState(""),
+    [to, setTo] = useState(""),
+    [transactionType, setTransactionType] = useState("all"),
     [search, setSearch] = useState("");
+
+  const defaultPerson = useCallback(
+    (tripId = "all") => {
+      const trip = data.trips.find((item: Trip) => item.id === tripId);
+      const candidates = trip
+        ? trip.memberIds
+            .map((id) => data.people.find((item: Person) => item.id === id))
+            .filter((item): item is Person => Boolean(item && !item.archived))
+        : data.people.filter((item: Person) => !item.archived);
+      return candidates.find((item) => item.id === "p1")?.id || candidates[0]?.id || "";
+    },
+    [data.people, data.trips],
+  );
+
+  const resolveRecordFilters = useCallback(
+    (requested: Partial<RecordFilters>): RecordFilters => {
+      const requestedTrip = requested.tripId ?? "all";
+      const tripId =
+        requestedTrip !== "all" && data.trips.some((trip: Trip) => trip.id === requestedTrip)
+          ? requestedTrip
+          : "all";
+      const allowedPeople =
+        tripId === "all"
+          ? data.people.filter((item: Person) => !item.archived)
+          : (data.trips.find((trip: Trip) => trip.id === tripId)?.memberIds || [])
+              .map((id) => data.people.find((item: Person) => item.id === id))
+              .filter((item): item is Person => Boolean(item && !item.archived));
+      const requestedPerson = requested.personId || "";
+      const personId = allowedPeople.some((item) => item.id === requestedPerson)
+        ? requestedPerson
+        : defaultPerson(tripId);
+
+      return {
+        personId,
+        tripId,
+        from: requested.from || "",
+        to: requested.to || "",
+        type: ledgerTypes.has(requested.type || "all") ? requested.type || "all" : "all",
+      };
+    },
+    [data.people, data.trips, defaultPerson],
+  );
+
   useEffect(() => {
     const applyUrl = () => {
       const query = new URLSearchParams(window.location.search);
-      const requestedTrip = query.get("tripId");
-      const requestedPerson = query.get("personId");
-      const requestedPage = query.get("page");
-      if (requestedTrip && data.trips.some((trip) => trip.id === requestedTrip)) {
-        setTripFilter(requestedTrip);
-        const trip = data.trips.find((item) => item.id === requestedTrip)!;
-        setPerson(
-          requestedPerson && trip.memberIds.includes(requestedPerson)
-            ? requestedPerson
-            : trip.memberIds.includes("p1")
-              ? "p1"
-              : trip.memberIds[0] || "p1",
-        );
-        setPage(
-          requestedPage === "daybook" || window.location.pathname.includes("daybook")
-            ? "daybook"
-            : "ledger",
-        );
-      }
+      const nextPage = pageFromView(query.get("view") || query.get("page"));
+      const filters = resolveRecordFilters({
+        tripId: query.get("tripId") || "all",
+        personId: query.get("personId") || "",
+        from: query.get("from") || "",
+        to: query.get("to") || "",
+        type: query.get("type") || "all",
+      });
+      setPage(nextPage);
+      setTripFilter(filters.tripId);
+      setPerson(filters.personId);
+      setFrom(filters.from);
+      setTo(filters.to);
+      setTransactionType(nextPage === "ledger" ? filters.type : "all");
+
+      const canonical = routeUrl(nextPage, filters);
+      if (`${window.location.pathname}${window.location.search}` !== canonical)
+        window.history.replaceState({}, "", canonical);
     };
     applyUrl();
     window.addEventListener("popstate", applyUrl);
     return () => window.removeEventListener("popstate", applyUrl);
-  }, [data.trips]);
+  }, [data.people, data.trips, resolveRecordFilters]);
+
+  const navigate = useCallback(
+    (nextPage: Page, requested: Partial<RecordFilters> = {}, replace = false) => {
+      const isCurrentRecordPage = recordPages.has(page);
+      const filters = resolveRecordFilters({
+        personId: requested.personId ?? (isCurrentRecordPage ? person : defaultPerson()),
+        tripId: requested.tripId ?? (isCurrentRecordPage ? tripFilter : "all"),
+        from: requested.from ?? (isCurrentRecordPage ? from : ""),
+        to: requested.to ?? (isCurrentRecordPage ? to : ""),
+        type: requested.type ?? (page === "ledger" ? transactionType : "all"),
+      });
+      const url = routeUrl(nextPage, filters);
+      window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+      setPage(nextPage);
+      setTripFilter(filters.tripId);
+      setPerson(filters.personId);
+      setFrom(filters.from);
+      setTo(filters.to);
+      setTransactionType(nextPage === "ledger" ? filters.type : "all");
+    },
+    [defaultPerson, from, page, person, resolveRecordFilters, to, transactionType, tripFilter],
+  );
+
+  const updateRecordFilters = useCallback(
+    (requested: Partial<RecordFilters>) => navigate(page, requested, true),
+    [navigate, page],
+  );
   const bal = useMemo(() => tripBalances(data), [data]),
     isArchivedTrip = (tripId?: string) =>
       Boolean(data.trips.find((trip: Trip) => trip.id === tripId)?.archived),
@@ -661,7 +767,7 @@ export default function Home() {
             key={key}
             className={`nav-link ${page === key ? "active" : ""}`}
             onClick={() => {
-              setPage(key);
+              navigate(key);
               setMenu(false);
             }}
           >
@@ -733,16 +839,14 @@ export default function Home() {
         )}
         {isDevelopment && <div className="dev-tools"><button onClick={loadSampleData}>Load Sample Data</button><button onClick={clearSampleData}>Clear Sample Data</button></div>}
         {page === "dashboard" && (
-          <Dashboard data={data} bal={bal} setPage={setPage} open={open} />
+          <Dashboard data={data} bal={bal} setPage={navigate} open={open} />
         )}{" "}
         {page === "trips" && (
           <Trips
             data={data}
             open={open}
             remove={destroy}
-            setTripFilter={setTripFilter}
-            setPerson={setPerson}
-            setPage={setPage}
+            setPage={navigate}
             archiveTrip={archiveTrip}
             restoreTrip={restoreTrip}
           />
@@ -757,7 +861,7 @@ export default function Home() {
             remove={destroy}
             person={person}
             setPerson={setPerson}
-            setPage={setPage}
+            setPage={navigate}
             archive={async (p: Person) =>
               save("people", { ...p, archived: true })
             }
@@ -768,9 +872,11 @@ export default function Home() {
             kind="ledger"
             data={data}
             person={person}
-            setPerson={setPerson}
             tripFilter={tripFilter}
-            setTripFilter={setTripFilter}
+            from={from}
+            to={to}
+            type={transactionType}
+            updateFilters={updateRecordFilters}
           />
         )}{" "}
         {page === "daybook" && (
@@ -778,9 +884,11 @@ export default function Home() {
             kind="daybook"
             data={data}
             person={person}
-            setPerson={setPerson}
             tripFilter={tripFilter}
-            setTripFilter={setTripFilter}
+            from={from}
+            to={to}
+            type={transactionType}
+            updateFilters={updateRecordFilters}
           />
         )}
       </section>
@@ -789,7 +897,7 @@ export default function Home() {
           <button
             key={key}
             className={page === key ? "active" : ""}
-            onClick={() => setPage(key)}
+            onClick={() => navigate(key)}
           >
             <Icon size={20} />
             <span>{label}</span>
@@ -1034,8 +1142,6 @@ function Trips({
   data,
   open,
   remove,
-  setTripFilter,
-  setPerson,
   setPage,
   archiveTrip,
   restoreTrip,
@@ -1066,16 +1172,8 @@ function Trips({
             preferred = t.memberIds.includes("p1") ? "p1" : t.memberIds[0],
             isArchived = Boolean(t.archived);
       const view = (page: string) => {
-        setTripFilter(t.id);
-        setPerson(preferred);
-        const query = new URLSearchParams({
-          page,
-          tripId: t.id,
-          personId: preferred,
-        });
-        window.history.replaceState({}, "", `${window.location.pathname}?${query}`);
-            setPage(page);
-          };
+        setPage(page, { tripId: t.id, personId: preferred });
+      };
           return (
             <article className="trip-card" key={t.id}>
               <div className="trip-banner">
@@ -1279,8 +1377,12 @@ function People({
                 <Ledger rows={r.slice(-5).reverse()} compact />
               </div>
               <div className="profile-actions">
-                <button onClick={() => setPage("ledger")}>Open ledger</button>
-                <button onClick={() => setPage("daybook")}>Open daybook</button>
+                <button onClick={() => setPage("ledger", { personId: picked.id })}>
+                  Open ledger
+                </button>
+                <button onClick={() => setPage("daybook", { personId: picked.id })}>
+                  Open daybook
+                </button>
                 <button onClick={() => archive(picked)}>Archive</button>
                 <button
                   className="danger"
@@ -1361,14 +1463,13 @@ function Records({
   kind,
   data,
   person,
-  setPerson,
   tripFilter,
-  setTripFilter,
+  from,
+  to,
+  type,
+  updateFilters,
 }: any) {
-  const [from, setFrom] = useState(""),
-    [to, setTo] = useState(""),
-    [type, setType] = useState("all"),
-    picked =
+  const picked =
       data.people.find((p: Person) => p.id === person) ||
       data.people.find((p: Person) => !p.archived),
     all = picked ? rows(data, picked.id) : [],
@@ -1532,18 +1633,6 @@ function Records({
         exportFile("trip-expenses", "xlsx"),
       );
     };
-  useEffect(() => {
-    if (tripFilter === "all" || !person) return;
-    const query = new URLSearchParams(window.location.search);
-    query.set("page", kind);
-    query.set("tripId", tripFilter);
-    query.set("personId", person);
-    window.history.replaceState(
-      {},
-      "",
-      `${window.location.pathname}?${query.toString()}`,
-    );
-  }, [kind, person, tripFilter]);
   const pdf = () => {
     const d = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
     d.setFontSize(18);
@@ -1556,6 +1645,8 @@ function Records({
       `From: ${from ? date(from) : "Beginning"}`,
       `To: ${to ? date(to) : "Today"}`,
     ].forEach((line, i) => d.text(line, 14, 21 + i * 5));
+    d.setFontSize(10);
+    d.text(`Total paid: ${money(paid)}   Total owed: ${money(owed)}   Net balance: ${money(final)}`, 14, 49);
     let body: any[] = [];
     if (kind === "daybook")
       Object.entries(groups).forEach(([day, rs]: any) => {
@@ -1575,18 +1666,25 @@ function Records({
             styles: { fillColor: [247, 251, 249], fontStyle: "bold" },
           },
         ]);
+        body.push([
+          {
+            content: `Daily settlements ${money(x.filter((row) => row.type.includes("Settlement")).reduce((sum, row) => sum + row.credit + row.debit, 0))}`,
+            colSpan: 10,
+            styles: { fillColor: [247, 251, 249], fontStyle: "bold" },
+          },
+        ]);
       });
     else body = filtered.map(rowCells);
     autoTable(d, {
-      startY: 49,
+      startY: 56,
       head: [
         [
           "Date",
           "Type",
           "Description",
           "Trip",
-          "From",
-          "To",
+          "Paid / sent by",
+          "Share for / received by",
           "Debit",
           "Credit",
           "Balance",
@@ -1627,7 +1725,9 @@ function Records({
       <div className="record-head">
         <div>
           <p className="page-intro">
-            The table and download always use the same selected filters.
+            {kind === "ledger"
+              ? "Track one person’s money for one trip."
+              : "See one person’s activity day by day for one trip."}
           </p>
           <div className="report-details">
             Person: <b>{picked?.name}</b> · Created: <b>{date(today())}</b> ·
@@ -1637,11 +1737,13 @@ function Records({
             </b>
           </div>
         </div>
-        <div className="record-actions">
-          <button className="primary" onClick={pdf}>
-            <Download size={18} />
-            Download PDF
-          </button>
+        <details className="export-menu">
+          <summary>
+            <Download size={17} />
+            Export
+          </summary>
+          <div className="export-options">
+          <button className="primary" onClick={pdf}>Download PDF</button>
           <button
             className="export-button"
             onClick={() =>
@@ -1665,14 +1767,15 @@ function Records({
           <button className="export-button" onClick={downloadExpensesExcel}>
             Download Trip Expenses Excel
           </button>
-        </div>
+          </div>
+        </details>
       </div>
       <section className="filters">
         <label>
           Person
           <select
             value={picked?.id || ""}
-            onChange={(e) => setPerson(e.target.value)}
+            onChange={(e) => updateFilters({ personId: e.target.value })}
           >
             {data.people
               .filter((p: Person) => !p.archived)
@@ -1687,7 +1790,7 @@ function Records({
           Trip
           <select
             value={tripFilter}
-            onChange={(e) => setTripFilter(e.target.value)}
+            onChange={(e) => updateFilters({ tripId: e.target.value })}
           >
             <option value="all">All trips</option>
             {data.trips.map((t: Trip) => (
@@ -1699,8 +1802,8 @@ function Records({
         </label>
         {kind === "ledger" && (
           <label>
-            Type
-            <select value={type} onChange={(e) => setType(e.target.value)}>
+            Transaction type
+            <select value={type} onChange={(e) => updateFilters({ type: e.target.value })}>
               <option value="all">All transactions</option>
               <option>Expense paid</option>
               <option>Expense share</option>
@@ -1710,19 +1813,19 @@ function Records({
           </label>
         )}
         <label>
-          From
+          From date
           <input
             type="date"
             value={from}
-            onChange={(e) => setFrom(e.target.value)}
+            onChange={(e) => updateFilters({ from: e.target.value })}
           />
         </label>
         <label>
-          To
+          To date
           <input
             type="date"
             value={to}
-            onChange={(e) => setTo(e.target.value)}
+            onChange={(e) => updateFilters({ to: e.target.value })}
           />
         </label>
       </section>
@@ -1730,7 +1833,7 @@ function Records({
         <Metric label="Total paid" value={money(paid)} />
         <Metric label="Total owed" value={money(owed)} />
         <Metric
-          label="Final balance"
+          label="Net balance"
           value={money(final)}
           note={<Status value={final} />}
         />
@@ -1739,14 +1842,20 @@ function Records({
         <section className="panel table-panel">
           <div className="panel-title">
             <div>
-              <p className="section-label">MYSPLITZ — LEDGER</p>
-              <h2>{filtered.length} transactions</h2>
+              <h2>Transactions</h2>
+              <p className="record-count">{filtered.length} records</p>
             </div>
           </div>
           <Ledger rows={filtered} />
         </section>
       ) : (
         <section className="daybook">
+          <div className="panel-title daybook-title">
+            <div>
+              <h2>Daily activity</h2>
+              <p className="record-count">{filtered.length} records</p>
+            </div>
+          </div>
           {Object.keys(groups).length ? (
             Object.entries(groups).map(([d, rs]: any) => (
               <article className="day-card" key={d}>
@@ -1755,6 +1864,13 @@ function Records({
                   <span>
                     End of day: <b>{money(rs[rs.length - 1].balance)}</b>
                   </span>
+                </div>
+                <div className="day-stats">
+                  <span><small>Transactions</small><b>{rs.length}</b></span>
+                  <span><small>Daily paid</small><b>{money(rs.reduce((a: number, r: Row) => a + r.credit, 0))}</b></span>
+                  <span><small>Daily owed</small><b>{money(rs.reduce((a: number, r: Row) => a + r.debit, 0))}</b></span>
+                  <span><small>Settlements</small><b>{money(rs.filter((r: Row) => r.type.includes("Settlement")).reduce((a: number, r: Row) => a + r.credit + r.debit, 0))}</b></span>
+                  <span><small>End-of-day balance</small><b>{money(rs[rs.length - 1].balance)}</b></span>
                 </div>
                 <Ledger rows={rs} />
                 <p className="daily-total">
@@ -1847,8 +1963,8 @@ function Ledger({ rows, compact }: any) {
             <th>Type</th>
             <th>Description</th>
             <th>Trip</th>
-            <th>From</th>
-            <th>To</th>
+            <th>Paid / sent by</th>
+            <th>Share for / received by</th>
             <th className="amount">Debit</th>
             <th className="amount">Credit</th>
             <th className="amount">Balance</th>
