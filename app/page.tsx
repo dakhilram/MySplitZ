@@ -91,6 +91,7 @@ type Data = {
   settlements: Settlement[];
   activity: Activity[];
 };
+type WriteResult = { ok: true } | { ok: false; message: string };
 type Row = {
   sourceId?: string;
   date: string;
@@ -208,8 +209,7 @@ function useData() {
   const [data, setData] = useState<Data>(seed),
     [loading, setLoading] = useState(true),
     [cloud, setCloud] = useState(false),
-    [connectionError, setConnectionError] = useState<string | null>(null),
-    [writeError, setWriteError] = useState<string | null>(null);
+    [connectionError, setConnectionError] = useState<string | null>(null);
   useEffect(() => {
     const cached = localStorage.getItem("dads-trip-book");
     if (cached) setData(JSON.parse(cached));
@@ -250,10 +250,21 @@ function useData() {
     );
     return () => stop.forEach((x) => x());
   }, []);
-  const save = async (name: keyof Data, value: any) => {
+  const failureMessage = (error: unknown, action: "save" | "delete") => {
+    const code = (error as { code?: string } | null)?.code;
+    if (code === "permission-denied")
+      return "Firestore denied this change. Check the Firestore rules and try again.";
+    if (code === "unavailable")
+      return "Firestore is temporarily unavailable. Check your connection and try again.";
+    if (code === "invalid-argument")
+      return "Some saved details are invalid. Review the form and try again.";
+    return action === "save"
+      ? "Could not save this record. Please try again."
+      : "Could not delete this record. Please try again.";
+  };
+  const save = async (name: keyof Data, value: any): Promise<WriteResult> => {
     if (!value || typeof value.id !== "string" || !value.id) {
-      setWriteError("This record is missing an ID and could not be saved.");
-      return false;
+      return { ok: false, message: "This record is missing an ID and could not be saved." };
     }
     const serialized = sanitizeFirestoreData(value);
     try {
@@ -270,14 +281,12 @@ function useData() {
         localStorage.setItem("dads-trip-book", JSON.stringify(n));
         return n;
       });
-      setWriteError(null);
-      return true;
-    } catch {
-      setWriteError("Could not save this record. Check your connection and try again.");
-      return false;
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: failureMessage(error, "save") };
     }
   };
-  const remove = async (name: keyof Data, id: string) => {
+  const remove = async (name: keyof Data, id: string): Promise<WriteResult> => {
     try {
       if (cloud && db) await deleteDoc(doc(db, name, id));
       else
@@ -289,14 +298,12 @@ function useData() {
         localStorage.setItem("dads-trip-book", JSON.stringify(n));
         return n;
       });
-      setWriteError(null);
-      return true;
-    } catch {
-      setWriteError("Could not delete this record. Check your connection and try again.");
-      return false;
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: failureMessage(error, "delete") };
     }
   };
-  return { data, loading, cloud, connectionError, writeError, save, remove };
+  return { data, loading, cloud, connectionError, save, remove };
 }
 const name = (data: Data, id?: string) =>
     data.people.find((p) => p.id === id)?.name || "—",
@@ -569,7 +576,7 @@ const Status = ({ value }: any) => (
 );
 const Empty = ({ children }: any) => <div className="empty">{children}</div>;
 export default function Home() {
-  const { data, loading, cloud, connectionError, writeError, save, remove } = useData(),
+  const { data, loading, cloud, connectionError, save, remove } = useData(),
     [page, setPage] = useState<AppPage>("dashboard"),
     [menu, setMenu] = useState(false),
     [modal, setModal] = useState<any>(null),
@@ -581,6 +588,12 @@ export default function Home() {
     [transactionType, setTransactionType] = useState("all"),
     [search, setSearch] = useState(""),
     [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(null), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
 
   const defaultPerson = useCallback(
     (tripId = "all") => {
@@ -642,9 +655,15 @@ export default function Home() {
       if (`${window.location.pathname}${window.location.search}` !== canonical)
         window.history.replaceState({}, "", canonical);
     };
+    const handlePopState = () => {
+      setNotice(null);
+      setModal(null);
+      setEditing(null);
+      applyUrl();
+    };
     applyUrl();
-    window.addEventListener("popstate", applyUrl);
-    return () => window.removeEventListener("popstate", applyUrl);
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
   }, [data.people, data.trips, resolveRecordFilters]);
 
   const navigate = useCallback(
@@ -659,6 +678,11 @@ export default function Home() {
       });
       const url = routeUrl(nextPage, filters, window.location.pathname);
       window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+      if (nextPage !== page) {
+        setNotice(null);
+        setModal(null);
+        setEditing(null);
+      }
       setPage(nextPage);
       setTripFilter(filters.tripId);
       setPerson(filters.personId);
@@ -700,23 +724,26 @@ export default function Home() {
       }),
     archiveTrip = async (trip: Trip) => {
       if (!confirm(`Archive ${trip.name}? Its records will remain available as read-only.`)) return;
-      if (await save("trips", { ...trip, archived: true })) {
+      const result = await save("trips", { ...trip, archived: true });
+      if (result.ok) {
         await activity(`${trip.name} archived`, "trip", undefined, trip.id);
         setNotice(`${trip.name} archived.`);
-      }
+      } else setNotice(result.message);
     },
     restoreTrip = async (trip: Trip) => {
-      if (await save("trips", { ...trip, archived: false })) {
+      const result = await save("trips", { ...trip, archived: false });
+      if (result.ok) {
         await activity(`${trip.name} restored`, "trip", undefined, trip.id);
         setNotice(`${trip.name} restored.`);
-      }
+      } else setNotice(result.message);
     },
     archivePerson = async (personToArchive: Person) => {
       if (!confirm(`Archive ${personToArchive.name}? Their past records will remain available.`))
         return;
-      if (await save("people", createPersonSavePayload({ ...personToArchive, archived: true }))) {
+      const result = await save("people", createPersonSavePayload({ ...personToArchive, archived: true }));
+      if (result.ok) {
         setNotice(`${personToArchive.name} archived.`);
-      }
+      } else setNotice(result.message);
     },
     destroy = async (type: keyof Data, item: any) => {
       if (
@@ -728,7 +755,8 @@ export default function Home() {
       }
       if (!confirm(`Delete this ${type.slice(0, -1)}? This cannot be undone.`))
         return;
-      if (await remove(type, item.id)) {
+      const result = await remove(type, item.id);
+      if (result.ok) {
         await activity(
           `${item.title || item.name || "Record"} deleted`,
           `deleted`,
@@ -736,7 +764,7 @@ export default function Home() {
           item.tripId,
         );
         setNotice("Record deleted.");
-      }
+      } else setNotice(result.message);
     };
   const isDevelopment = process.env.NODE_ENV !== "production";
   const loadSampleData = async () => {
@@ -744,7 +772,11 @@ export default function Home() {
     for (const collectionName of ["people", "trips", "expenses", "settlements"] as const) {
       for (const record of sampleData[collectionName]) {
         if (!(data[collectionName] as any[]).some((item) => item.id === record.id)) {
-          if (!(await save(collectionName, record))) return;
+          const result = await save(collectionName, record);
+          if (!result.ok) {
+            setNotice(result.message);
+            return;
+          }
           added += 1;
         }
       }
@@ -756,7 +788,11 @@ export default function Home() {
     let removed = 0;
     for (const collectionName of ["expenses", "settlements", "trips", "people"] as const) {
       for (const record of (data[collectionName] as any[]).filter((item) => item.isDemo)) {
-        if (!(await remove(collectionName, record.id))) return;
+        const result = await remove(collectionName, record.id);
+        if (!result.ok) {
+          setNotice(result.message);
+          return;
+        }
         removed += 1;
       }
     }
@@ -854,12 +890,19 @@ export default function Home() {
             </span>
           </button>
         </header>
-        {(firebaseSetupMessage || connectionError || writeError) && (
+        {(firebaseSetupMessage || connectionError) && (
           <div className="firebase-message" role="status">
-            {firebaseSetupMessage || connectionError || writeError}
+            {firebaseSetupMessage || connectionError}
           </div>
         )}
-        {notice && <div className="app-notice" role="status">{notice}</div>}
+        {notice && (
+          <div className="app-notice" role="status">
+            <span>{notice}</span>
+            <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss message">
+              <X size={16} />
+            </button>
+          </div>
+        )}
         {isDevelopment && <div className="dev-tools"><button onClick={loadSampleData}>Load Sample Data</button><button onClick={clearSampleData}>Clear Sample Data</button></div>}
         {page === "dashboard" && (
           <Dashboard data={data} bal={bal} setPage={navigate} open={open} />
@@ -935,13 +978,21 @@ export default function Home() {
           data={data}
           save={async (type: any, value: any, a: any) => {
             const saved = await save(type, value);
-            if (!saved) return false;
+            if (!saved.ok) return saved;
             if (a) await activity(a.text, a.kind, value.amount, value.tripId);
-            setNotice(`${a?.text || "Record"} saved.`);
+            setNotice(
+              type === "people"
+                ? `${value.name} ${a?.text?.includes("updated") ? "updated" : "added"} successfully`
+                : `${a?.text || "Record"} saved.`,
+            );
             setModal(null);
-            return true;
+            setEditing(null);
+            return saved;
           }}
-          close={() => setModal(null)}
+          close={() => {
+            setModal(null);
+            setEditing(null);
+          }}
         />
       )}
     </main>
@@ -2083,6 +2134,11 @@ function Form({ type, editing, data, save, close }: any) {
   );
   const [isSaving, setIsSaving] = useState(false),
     [formError, setFormError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!formError) return;
+    const timeout = window.setTimeout(() => setFormError(null), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [formError]);
   const update = (k: string, v: any) => {
       setFormError(null);
       setForm((p: any) => ({ ...p, [k]: v }));
@@ -2204,13 +2260,18 @@ function Form({ type, editing, data, save, close }: any) {
                   note: form.note || "",
                 };
       setIsSaving(true);
-      const saved = await save(collection, item, {
-        text: `${type === "expense" ? item.title : type === "trip" ? item.name : type === "person" ? item.name : "Settlement"} ${editing ? "updated" : "added"}`,
-        kind: type,
-        tripId: item.tripId,
-      });
-      setIsSaving(false);
-      if (!saved) setFormError("Could not save this record. Please try again.");
+      try {
+        const saved = await save(collection, item, {
+          text: `${type === "expense" ? item.title : type === "trip" ? item.name : type === "person" ? item.name : "Settlement"} ${editing ? "updated" : "added"}`,
+          kind: type,
+          tripId: item.tripId,
+        });
+        if (!saved.ok) setFormError(saved.message);
+      } catch {
+        setFormError("Could not save this record. Please try again.");
+      } finally {
+        setIsSaving(false);
+      }
     };
   return (
     <div className="modal-backdrop">
@@ -2230,7 +2291,14 @@ function Form({ type, editing, data, save, close }: any) {
             <X />
           </button>
         </div>
-        {formError && <p className="form-error" role="alert">{formError}</p>}
+        {formError && (
+          <p className="form-error" role="alert">
+            <span>{formError}</span>
+            <button type="button" onClick={() => setFormError(null)} aria-label="Dismiss error">
+              <X size={15} />
+            </button>
+          </p>
+        )}
         {type === "person" && (
           <>
             <Field

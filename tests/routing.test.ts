@@ -14,6 +14,14 @@ test("Home route clears Ledger filters while preserving the GitHub Pages base pa
   assert.equal(routeUrl("dashboard", filters, "/MySplitZ/"), "/MySplitZ/?view=home");
 });
 
+test("People uses its canonical route and clears report-only query state", () => {
+  assert.equal(routeUrl("people", filters, "/MySplitZ/"), "/MySplitZ/?view=people");
+  assert.deepEqual(parseRoute("?view=people"), {
+    page: "people",
+    filters: { tripId: "all", personId: "", from: "", to: "", type: "all" },
+  });
+});
+
 test("Ledger and Daybook filters restore from the URL", () => {
   assert.deepEqual(
     parseRoute("?view=ledger&tripId=demo-goa&personId=demo-dad&from=2026-02-14&to=2026-02-18&type=Expense+paid"),
