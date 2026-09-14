@@ -26,7 +26,7 @@ import {
   onSnapshot,
   setDoc,
 } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { db, firebaseSetupMessage } from "@/lib/firebase";
 import { sampleData } from "@/lib/demo-data";
 
 type Person = {
@@ -191,7 +191,8 @@ const nav = [
 function useData() {
   const [data, setData] = useState<Data>(seed),
     [loading, setLoading] = useState(true),
-    [cloud, setCloud] = useState(false);
+    [cloud, setCloud] = useState(false),
+    [connectionError, setConnectionError] = useState<string | null>(null);
   useEffect(() => {
     const cached = localStorage.getItem("dads-trip-book");
     if (cached) setData(JSON.parse(cached));
@@ -223,6 +224,9 @@ function useData() {
         },
         () => {
           setCloud(false);
+          setConnectionError(
+            "Firestore could not be reached. Check the Firebase project configuration and Firestore rules.",
+          );
           setLoading(false);
         },
       ),
@@ -256,7 +260,7 @@ function useData() {
         return n;
       });
   };
-  return { data, loading, cloud, save, remove };
+  return { data, loading, cloud, connectionError, save, remove };
 }
 const name = (data: Data, id?: string) =>
     data.people.find((p) => p.id === id)?.name || "—",
@@ -529,7 +533,7 @@ const Status = ({ value }: any) => (
 );
 const Empty = ({ children }: any) => <div className="empty">{children}</div>;
 export default function Home() {
-  const { data, loading, cloud, save, remove } = useData(),
+  const { data, loading, cloud, connectionError, save, remove } = useData(),
     [page, setPage] = useState("dashboard"),
     [menu, setMenu] = useState(false),
     [modal, setModal] = useState<any>(null),
@@ -542,6 +546,7 @@ export default function Home() {
       const query = new URLSearchParams(window.location.search);
       const requestedTrip = query.get("tripId");
       const requestedPerson = query.get("personId");
+      const requestedPage = query.get("page");
       if (requestedTrip && data.trips.some((trip) => trip.id === requestedTrip)) {
         setTripFilter(requestedTrip);
         const trip = data.trips.find((item) => item.id === requestedTrip)!;
@@ -552,7 +557,11 @@ export default function Home() {
               ? "p1"
               : trip.memberIds[0] || "p1",
         );
-        setPage(window.location.pathname.includes("daybook") ? "daybook" : "ledger");
+        setPage(
+          requestedPage === "daybook" || window.location.pathname.includes("daybook")
+            ? "daybook"
+            : "ledger",
+        );
       }
     };
     applyUrl();
@@ -717,6 +726,11 @@ export default function Home() {
             </span>
           </button>
         </header>
+        {(firebaseSetupMessage || connectionError) && (
+          <div className="firebase-message" role="status">
+            {firebaseSetupMessage || connectionError}
+          </div>
+        )}
         {isDevelopment && <div className="dev-tools"><button onClick={loadSampleData}>Load Sample Data</button><button onClick={clearSampleData}>Clear Sample Data</button></div>}
         {page === "dashboard" && (
           <Dashboard data={data} bal={bal} setPage={setPage} open={open} />
@@ -1054,11 +1068,12 @@ function Trips({
       const view = (page: string) => {
         setTripFilter(t.id);
         setPerson(preferred);
-        window.history.replaceState(
-              {},
-              "",
-              `/${page}?tripId=${t.id}&personId=${preferred}`,
-            );
+        const query = new URLSearchParams({
+          page,
+          tripId: t.id,
+          personId: preferred,
+        });
+        window.history.replaceState({}, "", `${window.location.pathname}?${query}`);
             setPage(page);
           };
           return (
@@ -1520,9 +1535,14 @@ function Records({
   useEffect(() => {
     if (tripFilter === "all" || !person) return;
     const query = new URLSearchParams(window.location.search);
+    query.set("page", kind);
     query.set("tripId", tripFilter);
     query.set("personId", person);
-    window.history.replaceState({}, "", `/${kind}?${query.toString()}`);
+    window.history.replaceState(
+      {},
+      "",
+      `${window.location.pathname}?${query.toString()}`,
+    );
   }, [kind, person, tripFilter]);
   const pdf = () => {
     const d = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });

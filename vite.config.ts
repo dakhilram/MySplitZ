@@ -49,6 +49,9 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    base: process.env.GITHUB_ACTIONS
+      ? `/${process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "MySplitZ"}/`
+      : "/",
     server: isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,
