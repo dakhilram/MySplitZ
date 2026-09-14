@@ -28,6 +28,14 @@ import {
 } from "firebase/firestore";
 import { db, firebaseSetupMessage } from "@/lib/firebase";
 import { sampleData } from "@/lib/demo-data";
+import { sanitizeFirestoreData } from "@/lib/firestore-serialization";
+import { createPersonSavePayload } from "@/lib/person-payload";
+import {
+  parseRoute,
+  routeUrl,
+  type AppPage,
+  type RecordFilters,
+} from "@/lib/routing";
 
 type Person = {
   id: string;
@@ -188,16 +196,7 @@ const nav = [
   ["ledger", "Ledger", BookOpen],
   ["daybook", "Daybook", ReceiptText],
 ] as const;
-type Page = (typeof nav)[number][0];
-type RecordFilters = {
-  personId: string;
-  tripId: string;
-  from: string;
-  to: string;
-  type: string;
-};
-
-const recordPages = new Set<Page>(["ledger", "daybook"]);
+const recordPages = new Set<AppPage>(["ledger", "daybook"]);
 const ledgerTypes = new Set([
   "all",
   "Expense paid",
@@ -205,28 +204,12 @@ const ledgerTypes = new Set([
   "Settlement paid",
   "Settlement received",
 ]);
-const pageFromView = (view: string | null): Page =>
-  view === "trips" || view === "people" || view === "ledger" || view === "daybook"
-    ? view
-    : "dashboard";
-const viewFromPage = (page: Page) => (page === "dashboard" ? "home" : page);
-
-function routeUrl(page: Page, filters: RecordFilters) {
-  const query = new URLSearchParams({ view: viewFromPage(page) });
-  if (recordPages.has(page)) {
-    if (filters.tripId !== "all") query.set("tripId", filters.tripId);
-    if (filters.personId) query.set("personId", filters.personId);
-    if (filters.from) query.set("from", filters.from);
-    if (filters.to) query.set("to", filters.to);
-    if (page === "ledger" && filters.type !== "all") query.set("type", filters.type);
-  }
-  return `${window.location.pathname}?${query.toString()}`;
-}
 function useData() {
   const [data, setData] = useState<Data>(seed),
     [loading, setLoading] = useState(true),
     [cloud, setCloud] = useState(false),
-    [connectionError, setConnectionError] = useState<string | null>(null);
+    [connectionError, setConnectionError] = useState<string | null>(null),
+    [writeError, setWriteError] = useState<string | null>(null);
   useEffect(() => {
     const cached = localStorage.getItem("dads-trip-book");
     if (cached) setData(JSON.parse(cached));
@@ -268,23 +251,36 @@ function useData() {
     return () => stop.forEach((x) => x());
   }, []);
   const save = async (name: keyof Data, value: any) => {
-    if (cloud && db) await setDoc(doc(db, name, value.id), value);
-    else
+    if (!value || typeof value.id !== "string" || !value.id) {
+      setWriteError("This record is missing an ID and could not be saved.");
+      return false;
+    }
+    const serialized = sanitizeFirestoreData(value);
+    try {
+      if (cloud && db) await setDoc(doc(db, name, serialized));
+      else
       setData((p) => {
         const n = {
           ...p,
           [name]: [
             ...(p[name] as any[]).filter((x) => x.id !== value.id),
-            value,
+            serialized,
           ],
         };
         localStorage.setItem("dads-trip-book", JSON.stringify(n));
         return n;
       });
+      setWriteError(null);
+      return true;
+    } catch {
+      setWriteError("Could not save this record. Check your connection and try again.");
+      return false;
+    }
   };
   const remove = async (name: keyof Data, id: string) => {
-    if (cloud && db) await deleteDoc(doc(db, name, id));
-    else
+    try {
+      if (cloud && db) await deleteDoc(doc(db, name, id));
+      else
       setData((p) => {
         const n = {
           ...p,
@@ -293,8 +289,14 @@ function useData() {
         localStorage.setItem("dads-trip-book", JSON.stringify(n));
         return n;
       });
+      setWriteError(null);
+      return true;
+    } catch {
+      setWriteError("Could not delete this record. Check your connection and try again.");
+      return false;
+    }
   };
-  return { data, loading, cloud, connectionError, save, remove };
+  return { data, loading, cloud, connectionError, writeError, save, remove };
 }
 const name = (data: Data, id?: string) =>
     data.people.find((p) => p.id === id)?.name || "—",
@@ -567,8 +569,8 @@ const Status = ({ value }: any) => (
 );
 const Empty = ({ children }: any) => <div className="empty">{children}</div>;
 export default function Home() {
-  const { data, loading, cloud, connectionError, save, remove } = useData(),
-    [page, setPage] = useState<Page>("dashboard"),
+  const { data, loading, cloud, connectionError, writeError, save, remove } = useData(),
+    [page, setPage] = useState<AppPage>("dashboard"),
     [menu, setMenu] = useState(false),
     [modal, setModal] = useState<any>(null),
     [editing, setEditing] = useState<any>(null),
@@ -577,7 +579,8 @@ export default function Home() {
     [from, setFrom] = useState(""),
     [to, setTo] = useState(""),
     [transactionType, setTransactionType] = useState("all"),
-    [search, setSearch] = useState("");
+    [search, setSearch] = useState(""),
+    [notice, setNotice] = useState<string | null>(null);
 
   const defaultPerson = useCallback(
     (tripId = "all") => {
@@ -623,14 +626,10 @@ export default function Home() {
 
   useEffect(() => {
     const applyUrl = () => {
-      const query = new URLSearchParams(window.location.search);
-      const nextPage = pageFromView(query.get("view") || query.get("page"));
+      const requestedRoute = parseRoute(window.location.search);
+      const nextPage = requestedRoute.page;
       const filters = resolveRecordFilters({
-        tripId: query.get("tripId") || "all",
-        personId: query.get("personId") || "",
-        from: query.get("from") || "",
-        to: query.get("to") || "",
-        type: query.get("type") || "all",
+        ...requestedRoute.filters,
       });
       setPage(nextPage);
       setTripFilter(filters.tripId);
@@ -639,7 +638,7 @@ export default function Home() {
       setTo(filters.to);
       setTransactionType(nextPage === "ledger" ? filters.type : "all");
 
-      const canonical = routeUrl(nextPage, filters);
+      const canonical = routeUrl(nextPage, filters, window.location.pathname);
       if (`${window.location.pathname}${window.location.search}` !== canonical)
         window.history.replaceState({}, "", canonical);
     };
@@ -649,7 +648,7 @@ export default function Home() {
   }, [data.people, data.trips, resolveRecordFilters]);
 
   const navigate = useCallback(
-    (nextPage: Page, requested: Partial<RecordFilters> = {}, replace = false) => {
+    (nextPage: AppPage, requested: Partial<RecordFilters> = {}, replace = false) => {
       const isCurrentRecordPage = recordPages.has(page);
       const filters = resolveRecordFilters({
         personId: requested.personId ?? (isCurrentRecordPage ? person : defaultPerson()),
@@ -658,7 +657,7 @@ export default function Home() {
         to: requested.to ?? (isCurrentRecordPage ? to : ""),
         type: requested.type ?? (page === "ledger" ? transactionType : "all"),
       });
-      const url = routeUrl(nextPage, filters);
+      const url = routeUrl(nextPage, filters, window.location.pathname);
       window.history[replace ? "replaceState" : "pushState"]({}, "", url);
       setPage(nextPage);
       setTripFilter(filters.tripId);
@@ -690,7 +689,7 @@ export default function Home() {
       setEditing(item);
       setModal(type);
     },
-    activity = (text: string, kind: string, amount?: number, tripId?: string) =>
+    activity = async (text: string, kind: string, amount?: number, tripId?: string) =>
       save("activity", {
         id: uid(),
         text,
@@ -701,12 +700,23 @@ export default function Home() {
       }),
     archiveTrip = async (trip: Trip) => {
       if (!confirm(`Archive ${trip.name}? Its records will remain available as read-only.`)) return;
-      await save("trips", { ...trip, archived: true });
-      await activity(`${trip.name} archived`, "trip", undefined, trip.id);
+      if (await save("trips", { ...trip, archived: true })) {
+        await activity(`${trip.name} archived`, "trip", undefined, trip.id);
+        setNotice(`${trip.name} archived.`);
+      }
     },
     restoreTrip = async (trip: Trip) => {
-      await save("trips", { ...trip, archived: false });
-      await activity(`${trip.name} restored`, "trip", undefined, trip.id);
+      if (await save("trips", { ...trip, archived: false })) {
+        await activity(`${trip.name} restored`, "trip", undefined, trip.id);
+        setNotice(`${trip.name} restored.`);
+      }
+    },
+    archivePerson = async (personToArchive: Person) => {
+      if (!confirm(`Archive ${personToArchive.name}? Their past records will remain available.`))
+        return;
+      if (await save("people", createPersonSavePayload({ ...personToArchive, archived: true }))) {
+        setNotice(`${personToArchive.name} archived.`);
+      }
     },
     destroy = async (type: keyof Data, item: any) => {
       if (
@@ -718,27 +728,39 @@ export default function Home() {
       }
       if (!confirm(`Delete this ${type.slice(0, -1)}? This cannot be undone.`))
         return;
-      await remove(type, item.id);
-      await activity(
-        `${item.title || item.name || "Record"} deleted`,
-        `deleted`,
-        item.amount,
-        item.tripId,
-      );
+      if (await remove(type, item.id)) {
+        await activity(
+          `${item.title || item.name || "Record"} deleted`,
+          `deleted`,
+          item.amount,
+          item.tripId,
+        );
+        setNotice("Record deleted.");
+      }
     };
   const isDevelopment = process.env.NODE_ENV !== "production";
   const loadSampleData = async () => {
+    let added = 0;
     for (const collectionName of ["people", "trips", "expenses", "settlements"] as const) {
       for (const record of sampleData[collectionName]) {
-        if (!(data[collectionName] as any[]).some((item) => item.id === record.id)) await save(collectionName, record);
+        if (!(data[collectionName] as any[]).some((item) => item.id === record.id)) {
+          if (!(await save(collectionName, record))) return;
+          added += 1;
+        }
       }
     }
+    setNotice(added ? `${added} sample records loaded.` : "Sample data is already loaded.");
   };
   const clearSampleData = async () => {
     if (!confirm("Clear only the sample records? Your own records will remain.")) return;
+    let removed = 0;
     for (const collectionName of ["expenses", "settlements", "trips", "people"] as const) {
-      for (const record of (data[collectionName] as any[]).filter((item) => item.isDemo)) await remove(collectionName, record.id);
+      for (const record of (data[collectionName] as any[]).filter((item) => item.isDemo)) {
+        if (!(await remove(collectionName, record.id))) return;
+        removed += 1;
+      }
     }
+    setNotice(removed ? "Sample data cleared." : "No sample data was found.");
   };
   if (loading)
     return (
@@ -832,11 +854,12 @@ export default function Home() {
             </span>
           </button>
         </header>
-        {(firebaseSetupMessage || connectionError) && (
+        {(firebaseSetupMessage || connectionError || writeError) && (
           <div className="firebase-message" role="status">
-            {firebaseSetupMessage || connectionError}
+            {firebaseSetupMessage || connectionError || writeError}
           </div>
         )}
+        {notice && <div className="app-notice" role="status">{notice}</div>}
         {isDevelopment && <div className="dev-tools"><button onClick={loadSampleData}>Load Sample Data</button><button onClick={clearSampleData}>Clear Sample Data</button></div>}
         {page === "dashboard" && (
           <Dashboard data={data} bal={bal} setPage={navigate} open={open} />
@@ -847,6 +870,7 @@ export default function Home() {
             open={open}
             remove={destroy}
             setPage={navigate}
+            notify={setNotice}
             archiveTrip={archiveTrip}
             restoreTrip={restoreTrip}
           />
@@ -862,9 +886,7 @@ export default function Home() {
             person={person}
             setPerson={setPerson}
             setPage={navigate}
-            archive={async (p: Person) =>
-              save("people", { ...p, archived: true })
-            }
+            archive={archivePerson}
           />
         )}{" "}
         {page === "ledger" && (
@@ -877,6 +899,7 @@ export default function Home() {
             to={to}
             type={transactionType}
             updateFilters={updateRecordFilters}
+            notify={setNotice}
           />
         )}{" "}
         {page === "daybook" && (
@@ -889,6 +912,7 @@ export default function Home() {
             to={to}
             type={transactionType}
             updateFilters={updateRecordFilters}
+            notify={setNotice}
           />
         )}
       </section>
@@ -910,9 +934,12 @@ export default function Home() {
           editing={editing}
           data={data}
           save={async (type: any, value: any, a: any) => {
-            await save(type, value);
+            const saved = await save(type, value);
+            if (!saved) return false;
             if (a) await activity(a.text, a.kind, value.amount, value.tripId);
+            setNotice(`${a?.text || "Record"} saved.`);
             setModal(null);
+            return true;
           }}
           close={() => setModal(null)}
         />
@@ -1143,6 +1170,7 @@ function Trips({
   open,
   remove,
   setPage,
+  notify,
   archiveTrip,
   restoreTrip,
 }: any) {
@@ -1212,7 +1240,14 @@ function Trips({
                 <div className="card-actions">
                   <button onClick={() => view("ledger")}>View ledger</button>
                   <button onClick={() => view("daybook")}>Daybook</button>
-                  <button onClick={() => downloadTripReport(data, t)}>
+                  <button onClick={() => {
+                    try {
+                      downloadTripReport(data, t);
+                      notify("Final trip report downloaded.");
+                    } catch {
+                      notify("Could not download the final trip report. Please try again.");
+                    }
+                  }}>
                     <Download size={15} />
                     Download Final Trip Report PDF
                   </button>
@@ -1468,6 +1503,7 @@ function Records({
   to,
   type,
   updateFilters,
+  notify,
 }: any) {
   const picked =
       data.people.find((p: Person) => p.id === person) ||
@@ -1633,6 +1669,12 @@ function Records({
         exportFile("trip-expenses", "xlsx"),
       );
     };
+  const runExport = (action: () => void | Promise<void>, label: string) => {
+    void Promise.resolve()
+      .then(action)
+      .then(() => notify(`${label} downloaded.`))
+      .catch(() => notify(`Could not download ${label}. Please try again.`));
+  };
   const pdf = () => {
     const d = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
     d.setFontSize(18);
@@ -1743,28 +1785,30 @@ function Records({
             Export
           </summary>
           <div className="export-options">
-          <button className="primary" onClick={pdf}>Download PDF</button>
+          <button className="primary" onClick={() => runExport(pdf, "PDF")}>Download PDF</button>
           <button
             className="export-button"
-            onClick={() =>
-              downloadCsv(ledgerHeaders, ledgerExportRows(filtered), kind)
-            }
+            onClick={() => runExport(
+              () => downloadCsv(ledgerHeaders, ledgerExportRows(filtered), kind),
+              `${kind === "ledger" ? "Ledger" : "Daybook"} CSV`,
+            )}
           >
             Download {kind === "ledger" ? "Ledger" : "Daybook"} CSV
           </button>
           <button
             className="export-button"
-            onClick={() =>
-              downloadCsv(
+            onClick={() => runExport(
+              () => downloadCsv(
                 expenseHeaders,
                 expenseExportRows(data, visibleExpenses),
                 "trip-expenses",
-              )
-            }
+              ),
+              "Trip Expenses CSV",
+            )}
           >
             Download Trip Expenses CSV
           </button>
-          <button className="export-button" onClick={downloadExpensesExcel}>
+          <button className="export-button" onClick={() => runExport(downloadExpensesExcel, "Trip Expenses Excel")}>
             Download Trip Expenses Excel
           </button>
           </div>
@@ -2037,7 +2081,12 @@ function Form({ type, editing, data, save, close }: any) {
                 note: "",
               }),
   );
-  const update = (k: string, v: any) => setForm((p: any) => ({ ...p, [k]: v })),
+  const [isSaving, setIsSaving] = useState(false),
+    [formError, setFormError] = useState<string | null>(null);
+  const update = (k: string, v: any) => {
+      setFormError(null);
+      setForm((p: any) => ({ ...p, [k]: v }));
+    },
     toggle = (k: string, id: string) =>
       update(
         k,
@@ -2052,15 +2101,20 @@ function Form({ type, editing, data, save, close }: any) {
     splitTotal = participants.reduce((total: number, id: string) => total + Number(splitValues[id] || 0), 0),
     exactInvalid = splitMethod === "exact" && Math.abs(splitTotal - amount) > 0.01,
     percentageInvalid = splitMethod === "percentage" && Math.abs(splitTotal - 100) > 0.01,
-    calculatedSplits = Object.fromEntries(participants.map((id: string) => [id, splitMethod === "equal" ? amount / participants.length : splitMethod === "percentage" ? amount * Number(splitValues[id] || 0) / 100 : Number(splitValues[id] || 0)])),
-    submit = (e: any) => {
+    calculatedSplits = Object.fromEntries(participants.map((id: string) => [id, splitMethod === "equal" ? amount / participants.length : splitMethod === "percentage" ? amount * Number(splitValues[id] || 0) / 100 : Number(splitValues[id] || 0)]));
+  const reject = (message: string) => {
+    setFormError(message);
+    return false;
+  };
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
       e.preventDefault();
+      if (isSaving) return;
       const selectedTrip = data.trips.find((trip: Trip) => trip.id === form.tripId);
       if (
         ((type === "expense" || type === "settlement") && selectedTrip?.archived) ||
         (type === "trip" && editing?.archived)
       ) {
-        return alert("This trip is archived. Restore it before making changes.");
+        return reject("This trip is archived. Restore it before making changes.");
       }
       if (
         type === "expense" &&
@@ -2070,14 +2124,22 @@ function Form({ type, editing, data, save, close }: any) {
           !form.paidBy ||
           !form.participantIds.length)
       )
-        return alert(
-          "Add a title, valid amount, trip, payer and at least one participant.",
-        );
-      if (exactInvalid) return alert(`Exact split total must equal ${money(amount)}.`);
-      if (percentageInvalid) return alert("Percentage split total must equal 100%.");
-      if (type === "person" && !form.name.trim()) return alert("Enter a name.");
-      if (type === "trip" && !form.name.trim())
-        return alert("Enter a trip name.");
+        return reject("Add a title, valid amount, trip, payer and at least one participant.");
+      if (type === "expense" && selectedTrip &&
+        (!selectedTrip.memberIds.includes(form.paidBy) ||
+          form.participantIds.some((id: string) => !selectedTrip.memberIds.includes(id)))
+      )
+        return reject("The payer and participants must be members of the selected trip.");
+      if (exactInvalid) return reject(`Exact split total must equal ${money(amount)}.`);
+      if (percentageInvalid) return reject("Percentage split total must equal 100%.");
+      if (type === "person" && !form.name.trim()) return reject("Enter a name.");
+      if (type === "person" && form.email && !/^\S+@\S+\.\S+$/.test(form.email))
+        return reject("Enter a valid email address.");
+      if (type === "trip" && !form.name.trim()) return reject("Enter a trip name.");
+      if (type === "trip" && (!form.startDate || !form.endDate || form.startDate > form.endDate))
+        return reject("Enter a valid trip date range.");
+      if (type === "trip" && !form.memberIds.length)
+        return reject("Add at least one trip member.");
       if (
         type === "settlement" &&
         (Number(form.amount) <= 0 ||
@@ -2085,17 +2147,11 @@ function Form({ type, editing, data, save, close }: any) {
           !form.to ||
           form.from === form.to)
       )
-        return alert("Choose two different people and a valid amount.");
-      const item = {
-        ...form,
-        id: editing?.id || uid(),
-        amount:
-          type === "person" || type === "trip"
-            ? undefined
-            : Number(form.amount),
-        splitMethod: type === "expense" ? splitMethod : undefined,
-        splits: type === "expense" ? calculatedSplits : undefined,
-      };
+        return reject("Choose two different people and a valid amount.");
+      if (type === "settlement" && selectedTrip &&
+        (!selectedTrip.memberIds.includes(form.from) || !selectedTrip.memberIds.includes(form.to)))
+        return reject("Settlement people must be members of the selected trip.");
+      const id = editing?.id || uid();
       const collection =
         type === "person"
           ? "people"
@@ -2104,11 +2160,57 @@ function Form({ type, editing, data, save, close }: any) {
             : type === "expense"
               ? "expenses"
               : "settlements";
-      save(collection, item, {
+      const item =
+        type === "person"
+          ? createPersonSavePayload({
+              id,
+              name: form.name,
+              phone: form.phone,
+              email: form.email,
+              notes: form.notes,
+              archived: editing?.archived,
+            })
+          : type === "trip"
+            ? {
+                id,
+                name: form.name.trim(),
+                description: form.description || "",
+                startDate: form.startDate,
+                endDate: form.endDate,
+                memberIds: form.memberIds,
+                ...(editing?.archived ? { archived: true } : {}),
+              }
+            : type === "expense"
+              ? {
+                  id,
+                  title: form.title.trim(),
+                  amount,
+                  category: form.category,
+                  date: form.date,
+                  tripId: form.tripId,
+                  paidBy: form.paidBy,
+                  participantIds: form.participantIds,
+                  splitMethod,
+                  splits: calculatedSplits,
+                  note: form.note || "",
+                }
+              : {
+                  id,
+                  from: form.from,
+                  to: form.to,
+                  amount,
+                  date: form.date,
+                  ...(form.tripId ? { tripId: form.tripId } : {}),
+                  note: form.note || "",
+                };
+      setIsSaving(true);
+      const saved = await save(collection, item, {
         text: `${type === "expense" ? item.title : type === "trip" ? item.name : type === "person" ? item.name : "Settlement"} ${editing ? "updated" : "added"}`,
         kind: type,
         tripId: item.tripId,
       });
+      setIsSaving(false);
+      if (!saved) setFormError("Could not save this record. Please try again.");
     };
   return (
     <div className="modal-backdrop">
@@ -2124,10 +2226,11 @@ function Form({ type, editing, data, save, close }: any) {
                   : `Add ${type}`}
             </h2>
           </div>
-          <button type="button" className="icon" onClick={close}>
+          <button type="button" className="icon" onClick={close} disabled={isSaving}>
             <X />
           </button>
         </div>
+        {formError && <p className="form-error" role="alert">{formError}</p>}
         {type === "person" && (
           <>
             <Field
@@ -2362,11 +2465,11 @@ function Form({ type, editing, data, save, close }: any) {
           </>
         )}
         <div className="modal-actions">
-          <button type="button" onClick={close}>
+          <button type="button" onClick={close} disabled={isSaving}>
             Cancel
           </button>
-          <button className="primary" type="submit">
-            {editing ? "Save changes" : "Save record"}
+          <button className="primary" type="submit" disabled={isSaving}>
+            {isSaving ? "Saving…" : editing ? "Save changes" : "Save record"}
           </button>
         </div>
       </form>
