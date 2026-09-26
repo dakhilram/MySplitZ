@@ -27,6 +27,7 @@ import {
   setDoc,
 } from "firebase/firestore";
 import { db, firebaseSetupMessage } from "@/lib/firebase";
+import { autonomousTestMetadata } from "@/lib/autonomous-test";
 import { sampleData } from "@/lib/demo-data";
 import { sanitizeFirestoreData } from "@/lib/firestore-serialization";
 import { createPersonSavePayload } from "@/lib/person-payload";
@@ -266,7 +267,7 @@ function useData() {
     if (!value || typeof value.id !== "string" || !value.id) {
       return { ok: false, message: "This record is missing an ID and could not be saved." };
     }
-    const serialized = sanitizeFirestoreData(value);
+    const serialized = sanitizeFirestoreData({ ...value, ...autonomousTestMetadata() });
     try {
       if (cloud && db) await setDoc(doc(db, name, serialized));
       else
